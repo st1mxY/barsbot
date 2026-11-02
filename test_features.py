@@ -94,6 +94,34 @@ class FeaturesTests(unittest.TestCase):
         self.assertEqual(f.data["tasks"], [])
         self.assertEqual(f.data["pe"], [])
 
+    def test_all_absences_are_grouped_by_subject_only_unexcused_this_semester(self):
+        marks = {"semester": "2026/2027, Осенний семестр", "disciplines": {
+            "Иностранный язык в сфере профессиональной коммуникации, Пивкина Н.Н., зачёт, 2ЗЕ": {},
+            "Метрология, стандартизация и сертификация, Желбаков И.Н., экзамен, 5ЗЕ": {},
+            "Базы данных, Зейн А.Н., экзамен, 4ЗЕ": {},
+        }}
+        items = {}
+        for i, (date, subject, status) in enumerate((
+            ("02.11.26", "Иностранный язык в сфере профессиональной коммуникации", "пропуск"),
+            ("03.11.26", "Иностранный язык в сфере профессиональной коммуникации", "пропуск по неуважительной причине"),
+            ("04.11.26", "Иностранный язык в сфере профессиональной коммуникации", "пропуск по уважительной причине"),
+            ("01.03.26", "Иностранный язык в сфере профессиональной коммуникации", "пропуск"),
+            ("02.11.26", "Метрология, стандартизация и сертификация", "пропуск"),
+        )):
+            items[str(i)] = {"desc": f"{date}, 1 пара (09:20-10:55), лекция (Иванов И.И.), {subject} (экзамен), Аэ-21-24", "status": status}
+        self.f.command("/pe add 02.11.2026 5", {})
+        result = self.f.command("/absences", {"Оценки": marks, "Пропуски": {"items": items}})
+        table = {line.split("│")[0].strip(): line.split("│")[1].strip()
+                 for line in result.splitlines() if "│" in line}
+        self.assertEqual(table["Английский"], "2")
+        self.assertEqual(table["Метрология"], "1")
+        self.assertEqual(table["Базы данных"], "0")
+        self.assertEqual(table["Всего"].removesuffix("</pre>"), "3")
+        self.assertNotIn("02.11.26", result)
+
+    def test_absences_without_snapshot_do_not_report_fake_zeroes(self):
+        self.assertIn("Пока нет данных", self.f.command("/absences", {}))
+
     def test_invalid_input_does_not_mutate(self):
         for cmd in ("/todo add X | 31.02.2026", "/pe add 02.11.2026 -1", "/auto 1 nan", "/auto 3 4.2 0"):
             self.assertTrue(self.f.command(cmd, {}).startswith("❗"))

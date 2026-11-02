@@ -6,6 +6,7 @@ import json
 import math
 import re
 import threading
+import textwrap
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -49,6 +50,49 @@ def lesson_date(desc: str):
                                  else "%d.%m.%Y").date().isoformat()
     except ValueError:
         return None
+
+
+def is_excused(status: str) -> bool:
+    status = status.lower()
+    if re.search(r"\b(?:не\s*уважит|без\s+уважит)", status):
+        return False
+    return bool(re.search(r"\bуважит", status))
+
+
+def discipline_name(title: str) -> str:
+    return re.split(r",\s*[А-ЯЁ][а-яё-]+\s+[А-ЯЁ]\.", title, maxsplit=1)[0].strip()
+
+
+def lesson_subject(desc: str) -> str:
+    # Делим только запятые вне скобок: тип занятия и дисциплина могут
+    # содержать преподавателей, запятые и вложенные скобки.
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(desc):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append(desc[start:i].strip())
+            start = i + 1
+    parts.append(desc[start:].strip())
+    if len(parts) < 4:
+        return ""
+    tail = parts[3:]
+    if len(tail) > 1 and (tail[-1] == "Группа" or re.fullmatch(r"[\w-]*\d[\w-]*", tail[-1])):
+        tail = tail[:-1]
+    subject = ", ".join(tail)
+    return re.sub(r"\s*\((?:[^()]|\([^()]*\))*\)\s*$", "", subject).strip()
+
+
+def display_subject(name: str) -> str:
+    return {
+        "Иностранный язык в сфере профессиональной коммуникации": "Английский",
+        "Метрология, стандартизация и сертификация": "Метрология",
+        "Спортивные секции": "Физра (БАРС)",
+        "Технологии обработки и передачи данных": "Обработка и передача данных",
+        "Производственная практика: научно-исследовательская работа": "Произв. практика",
+    }.get(name, name)
 
 
 def subject_index(value: str) -> int:
@@ -119,6 +163,7 @@ def required_average(rows, weights, target=4.2):
 
 
 HELP = """/subjects — таблица важных предметов и пропусков
+/absences — количество неуважительных пропусков по всем предметам
 /auto — условия автомата и настройка
 /pe — отдельный журнал пропусков физры
 /todo — список дел и команды
@@ -193,19 +238,20 @@ class PersonalFeatures:
             count = excused = 0
             unknown = False
             for item in (absences or {}).get("items", {}).values():
-                parts = re.split(r",\s+(?![^()]*\))", item.get("desc", ""))
-                if len(parts) < 4 or stem not in parts[3].lower():
+                if stem not in lesson_subject(item.get("desc", "")).lower():
                     continue
                 date = lesson_date(item["desc"])
                 if not date:
                     unknown = True
                 elif start and start <= date < end:
                     count += 1
-                    excused += int("уважит" in item.get("status", "").lower())
+                    excused += int(is_excused(item.get("status", "")))
             known = start and absences is not None and not unknown
             target = self.data.get("targets", {}).get(str(i), {})
             weights = marks.get("weights", {}).get(title, {})
             forecast = required_average(rows, weights, target.get("score", 4.2))
+            if forecast == "Пересдать":
+                forecast = "Пересд."
             columns.append({
                 "kms": values,
                 "Балл": rows.get("Балл текущего контроля") or "—",
@@ -213,7 +259,7 @@ class PersonalFeatures:
                 "Без уваж.": str(count - excused) if known else "?",
                 "Лимит": str(math.floor(target.get("lessons", LESSON_TOTALS[i]) * .0625)),
             })
-        headers = ("", "Метрология", "Схемотех.", "БД")
+        headers = ("", "Метр.", "Схем.", "БД")
         table = [headers]
         for number in sorted(km_numbers):
             table.append((f"КМ{number}", *(c["kms"].get(number, "—") for c in columns)))
@@ -221,15 +267,49 @@ class PersonalFeatures:
             table.append((label, *(c[label] for c in columns)))
         widths = [max(len(row[i]) for row in table) for i in range(4)]
         def line(row):
-            return " │ ".join(cell.ljust(widths[i]) if i == 0 else cell.center(widths[i])
+            return "│".join(cell.ljust(widths[i]) if i == 0 else cell.center(widths[i])
                               for i, cell in enumerate(row))
-        divider = "─┼─".join("─" * width for width in widths)
+        divider = "┼".join("─" * width for width in widths)
         lines = [line(table[0]), divider]
         for row in table[1:]:
             if row[0] == "Балл":
                 lines.append(divider)
             lines.append(line(row))
         return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
+
+    def absences(self, snapshots: dict):
+        marks = snapshots.get("Оценки", {})
+        snapshot = snapshots.get("Пропуски")
+        start = semester_start(marks.get("semester", ""))
+        if snapshot is None or not start:
+            return "Пока нет данных о пропусках за текущий семестр. Нажми «Проверить БАРС»."
+        year = int(start[:4])
+        end = f"{year + 1}-02-01" if start.endswith("09-01") else f"{year}-09-01"
+        counts = {discipline_name(title): 0 for title in marks.get("disciplines", {})}
+        canonical = {name.casefold(): name for name in counts}
+        skipped = 0
+        for item in snapshot.get("items", {}).values():
+            if is_excused(item.get("status", "")):
+                continue
+            date = lesson_date(item.get("desc", ""))
+            if date and not start <= date < end:
+                continue
+            name = lesson_subject(item.get("desc", ""))
+            if not date or not name:
+                skipped += 1
+                continue
+            name = canonical.get(name.casefold(), name)
+            counts[name] = counts.get(name, 0) + 1
+        lines = [f"{'Предмет':<26} │ Пар", "─" * 27 + "┼────"]
+        for name, count in sorted(counts.items(), key=lambda pair: (-pair[1], display_subject(pair[0]).casefold())):
+            wrapped = textwrap.wrap(display_subject(name), width=26) or ["—"]
+            lines.append(f"{wrapped[0]:<26} │ {count:>3}")
+            lines.extend(f"{line:<26} │" for line in wrapped[1:])
+        lines.extend(["─" * 27 + "┼────", f"{'Всего':<26} │ {sum(counts.values()):>3}"])
+        result = "🚫 <b>Пропуски без уважительной причины</b>\n<pre>" + html.escape("\n".join(lines)) + "</pre>"
+        if skipped:
+            result += f"\nНе удалось разобрать записей: {skipped}; в итог не включены."
+        return result
 
     def command(self, text: str, snapshots: dict):
         with self.lock:
@@ -238,6 +318,8 @@ class PersonalFeatures:
             try:
                 if cmd == "/subjects":
                     return self.subjects(snapshots)
+                if cmd == "/absences":
+                    return self.absences(snapshots)
                 if cmd == "/auto":
                     if not arg:
                         rules = []

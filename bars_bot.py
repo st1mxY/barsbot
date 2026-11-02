@@ -52,6 +52,7 @@ MARKS_URL = os.getenv("MARKS_URL", "").strip()
 ABSENCES_URL = os.getenv("ABSENCES_URL", "").strip()
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+TG_PROXY = os.getenv("TG_PROXY", "").strip()
 CHECK_INTERVAL_MIN = float(os.getenv("CHECK_INTERVAL_MIN", "20"))
 QUIET_HOURS = os.getenv("QUIET_HOURS", "").strip()  # например "1-7": ночью не проверять
 STATE_FILE = BASE_DIR / os.getenv("STATE_FILE", "state.json")
@@ -559,6 +560,28 @@ class Telegram:
     def __init__(self, token: str, chat_id: str):
         self.api = f"https://api.telegram.org/bot{token}/"
         self.chat_id = chat_id
+        self.proxies = {"http": TG_PROXY, "https": TG_PROXY} if TG_PROXY else None
+        self._local = threading.local()
+
+    def _session(self) -> requests.Session:
+        # У каждого потока своя сессия: polling и планировщик не делят
+        # изменяемое состояние, а последовательные запросы используют один TLS-туннель.
+        if not hasattr(self._local, "session"):
+            session = requests.Session()
+            if self.proxies:
+                session.trust_env = False
+            self._local.session = session
+        return self._local.session
+
+    def _reset_session(self) -> None:
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            session.close()
+            del self._local.session
+
+    @property
+    def last_message_id(self):
+        return getattr(self._local, "last_message_id", None)
 
     def send(self, text: str, chat_id: str | None = None, reply_markup=MAIN_MENU) -> bool:
         chat = chat_id or self.chat_id
@@ -586,36 +609,74 @@ class Telegram:
             }
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
-            r = requests.post(self.api + "sendMessage", json=payload, timeout=30)
+            r = self._session().post(self.api + "sendMessage", json=payload, timeout=(10, 20), proxies=self.proxies)
             if not r.ok:
-                log.error("Telegram ответил %s: %s", r.status_code, r.text[:300])
+                log.error("Telegram ответил %s: %s", r.status_code, redact_secrets(r.text[:300]))
                 return False
-            return bool(r.json().get("ok"))
+            response = r.json()
+            result = response.get("result")
+            self._local.last_message_id = result.get("message_id") if isinstance(result, dict) else None
+            return bool(response.get("ok"))
         except requests.RequestException as e:
-            log.error("Не удалось отправить в Telegram: %s", e)
+            self._reset_session()
+            log.error("Не удалось отправить в Telegram: %s", redact_secrets(e))
             return False
+
+    def edit_message(self, message_id: int, text: str, reply_markup=MAIN_MENU) -> bool | None:
+        try:
+            r = self._session().post(self.api + "editMessageText", json={
+                "chat_id": self.chat_id, "message_id": message_id,
+                "text": text, "parse_mode": "HTML", "disable_web_page_preview": True,
+                "reply_markup": reply_markup or {"inline_keyboard": []},
+            }, timeout=(10, 20), proxies=self.proxies)
+            result = r.json()
+            description = result.get("description", "").lower()
+            if result.get("ok") or "message is not modified" in description:
+                return True
+            if r.status_code == 400 and any(reason in description for reason in (
+                "message to edit not found", "message can't be edited", "message_id_invalid"
+            )):
+                return False  # Удалённое/старое меню заменяем новым сообщением.
+            log.warning("Telegram не обновил меню: %s", redact_secrets(result.get("description", r.status_code)))
+        except requests.RequestException as e:
+            self._reset_session()
+            log.warning("Не удалось обновить меню Telegram: %s", redact_secrets(e))
+        return None  # При тайм-ауте не создаём потенциальный дубликат меню.
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         if not callback_id:
             return
         try:
-            r = requests.post(self.api + "answerCallbackQuery", json={
+            r = self._session().post(self.api + "answerCallbackQuery", json={
                 "callback_query_id": callback_id, "text": text,
-            }, timeout=10)
+            }, timeout=(10, 10), proxies=self.proxies)
             r.raise_for_status()
         except requests.RequestException:
+            self._reset_session()
             log.warning("Не удалось подтвердить нажатие кнопки Telegram")
 
     def updates(self, offset: int) -> list[dict]:
-        r = requests.get(self.api + "getUpdates",
-                         params={"offset": offset, "timeout": 50}, timeout=60)
-        r.raise_for_status()
-        return r.json().get("result", [])
+        try:
+            r = self._session().get(self.api + "getUpdates",
+                                   params={"offset": offset, "timeout": 15}, timeout=(10, 25), proxies=self.proxies)
+            r.raise_for_status()
+            return r.json().get("result", [])
+        except requests.RequestException:
+            self._reset_session()
+            raise
 
 
 # --------------------------------------------------------------------------- #
 #  Основная логика
 # --------------------------------------------------------------------------- #
+
+def redact_secrets(value) -> str:
+    text = str(value)
+    if TG_TOKEN:
+        text = text.replace(TG_TOKEN, "[TOKEN]")
+    text = re.sub(r"(api\.telegram\.org/(?:bot)?)[^/\s'\"]+", r"\1[TOKEN]", text)
+    return re.sub(r"(https?://)[^/\s@]+@", r"\1[AUTH]@", text)
+
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -788,7 +849,7 @@ def commands_loop(w: Watcher, tg: Telegram, stop: threading.Event) -> None:
                     continue
                 ui.menu()
         except requests.RequestException as e:
-            log.warning("getUpdates: %s", e)
+            log.warning("getUpdates: %s", redact_secrets(e))
             stop.wait(10)
 
 

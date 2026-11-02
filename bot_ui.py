@@ -20,7 +20,7 @@ def keyboard(*rows):
 HOME = [button("🏠 Главное меню", "home")]
 CANCEL = keyboard([button("Отмена", "cancel")])
 MAIN_MENU = keyboard(
-    [button("📚 Важные предметы", "subjects")],
+    [button("📚 Важные предметы", "subjects"), button("🚫 Пропуски БАРС", "absences")],
     [button("🏃 Пропуски физры", "pe"), button("📝 Список дел", "tasks")],
     [button("🔄 Проверить БАРС", "check"), button("ℹ️ Статус", "status")],
 )
@@ -36,9 +36,21 @@ class BotUI:
         self.features = watcher.features
         self.status_text = status_text
         self.pending = None
+        self.message_id = None
+
+    def send(self, text, reply_markup=MAIN_MENU):
+        # Переходы, диалоги и подтверждения занимают одно сообщение.
+        if self.message_id:
+            edited = self.tg.edit_message(self.message_id, text, reply_markup=reply_markup)
+            if edited is not False:
+                return edited
+        sent = self.tg.send(text, reply_markup=reply_markup)
+        if sent:
+            self.message_id = self.tg.last_message_id
+        return sent
 
     def menu(self):
-        self.tg.send("Выбери раздел 👇", reply_markup=MAIN_MENU)
+        self.send("Выбери раздел 👇", reply_markup=MAIN_MENU)
 
     def snapshots(self):
         with self.w.state_lock:
@@ -46,7 +58,7 @@ class BotUI:
 
     def prompt(self, kind, text, extra=None, markup=CANCEL):
         self.pending = {"kind": kind, "time": time.monotonic(), **(extra or {})}
-        self.tg.send(text, reply_markup=markup)
+        self.send(text, reply_markup=markup)
 
     def data_list(self, key):
         with self.features.lock:
@@ -74,7 +86,7 @@ class BotUI:
         rows.append([button("➕ Добавить пропуск", "pe:add"), button("🗑 Удалить запись", "pe:delete")])
         rows.append([button("🔄 Обновить журнал", "pe")])
         rows.append(HOME)
-        self.tg.send(text, reply_markup=keyboard(*rows))
+        self.send(text, reply_markup=keyboard(*rows))
 
     def page_buttons(self, prefix, page, total):
         row = []
@@ -95,14 +107,15 @@ class BotUI:
         for t in tasks[page * self.PAGE_SIZE:(page + 1) * self.PAGE_SIZE]:
             due = f" · до {t['due']}" if t["due"] else ""
             late = " ⏰ просрочено" if t["due"] and t["due"] < today and not t["done"] else ""
-            text += f"\n\n{'✅' if t['done'] else '▫️'} #{t['id']} {html.escape(t['title'])}{due}{late}"
+            title = t["title"][:120] + ("…" if len(t["title"]) > 120 else "")
+            text += f"\n\n{'✅' if t['done'] else '▫️'} #{t['id']} {html.escape(title)}{due}{late}"
             rows.append([button(f"#{t['id']} {t['title'][:45]}", f"task:view:{t['id']}")])
         if not tasks:
             text += "\n\nДел пока нет."
         rows += self.page_buttons("tasks:allpage" if all_tasks else "tasks:page", page, len(tasks))
         rows.append([button("➕ Добавить дело", "task:add"), button("📋 Все дела" if not all_tasks else "▫️ Открытые", "tasks:all" if not all_tasks else "tasks")])
         rows.append(HOME)
-        self.tg.send(text, reply_markup=keyboard(*rows))
+        self.send(text, reply_markup=keyboard(*rows))
 
     def task(self, ident):
         task = next((t for t in self.data_list("tasks") if t["id"] == ident), None)
@@ -114,14 +127,14 @@ class BotUI:
         task = self.task(ident)
         text = f"📝 <b>Дело #{ident}</b>\n{html.escape(task['title'])}"
         text += f"\nДедлайн: {task['due'] or 'не задан'}.\nСтатус: {'выполнено' if task['done'] else 'открыто'}."
-        self.tg.send(text, reply_markup=keyboard(
+        self.send(text, reply_markup=keyboard(
             [button("↩️ Вернуть в открытые" if task["done"] else "✅ Выполнено", f"task:{'open' if task['done'] else 'done'}:{ident}")],
             [button("📅 Изменить дедлайн", f"task:deadline:{ident}"), button("🗑 Удалить", f"task:confirm:{ident}")],
             [button("📝 К списку дел", "tasks")], HOME))
 
     def show_auto(self):
         text = self.features.command("/auto", {}).split("\n\nИзменить:")[0]
-        self.tg.send("🎯 <b>Условия автомата</b>\n" + text + "\n\nВыбери предмет для изменения условий.",
+        self.send("🎯 <b>Условия автомата</b>\n" + text + "\n\nВыбери предмет для изменения условий.",
                      reply_markup=keyboard(*[[button(name, f"auto:edit:{i}")] for i, (name, _) in enumerate(SUBJECTS)], HOME))
 
     def handle_callback(self, callback):
@@ -131,11 +144,12 @@ class BotUI:
             self.tg.answer_callback(callback.get("id", ""), "Это личный бот.")
             return
         self.tg.answer_callback(callback.get("id", ""))
+        self.message_id = callback.get("message", {}).get("message_id")
         action = callback.get("data", "")
         try:
             self.action(action)
         except (ValueError, OverflowError) as exc:
-            self.tg.send("❗ " + html.escape(str(exc)), reply_markup=keyboard(HOME))
+            self.send("❗ " + html.escape(str(exc)), reply_markup=keyboard(HOME))
 
     def action(self, action):
         # Кнопки внутри диалога действуют только для текущего шага.
@@ -143,7 +157,7 @@ class BotUI:
             expected = {"pe:today": "pe_date", "pe:count:1": "pe_count", "pe:count:2": "pe_count",
                         "task:nodue": "task_due", "task:cleardue": "task_deadline"}[action]
             if not self.pending or self.pending["kind"] != expected or self.expired():
-                self.tg.send("Этот шаг уже завершён. Открой раздел заново.")
+                self.send("Этот шаг уже завершён. Открой раздел заново.")
                 return
             values = {"pe:today": now_moscow().date().isoformat(), "pe:count:1": "1",
                       "pe:count:2": "2", "task:nodue": "-", "task:cleardue": "-"}
@@ -154,14 +168,17 @@ class BotUI:
             self.menu()
         elif action == "subjects":
             text = self.features.command("/subjects", self.snapshots())
-            self.tg.send(text, reply_markup=keyboard([button("🔄 Обновить сводку", "subjects"), button("🔄 Проверить БАРС", "check")], HOME))
+            self.send(text, reply_markup=keyboard([button("🔄 Обновить сводку", "subjects"), button("🔄 Проверить БАРС", "check")], HOME))
+        elif action == "absences":
+            self.send(self.features.command("/absences", self.snapshots()), reply_markup=keyboard(
+                [button("🔄 Обновить таблицу", "absences"), button("🔄 Проверить БАРС", "check")], HOME))
         elif action == "status":
-            self.tg.send(self.status_text(), reply_markup=MAIN_MENU)
+            self.send(self.status_text(), reply_markup=MAIN_MENU)
         elif action == "check":
             if self.w.lock.locked():
-                self.tg.send("Проверка БАРС уже идёт. Результат придёт сюда.")
+                self.send("Проверка БАРС уже идёт. Результат придёт сюда.")
             else:
-                self.tg.send("Проверяю БАРС… Результат придёт сюда.")
+                self.send("Проверяю БАРС… Результат придёт сюда.")
                 threading.Thread(target=self.w.check, kwargs={"manual": True}, daemon=True).start()
         elif action == "pe" or action == "pe:delete":
             self.show_pe(deleting=action == "pe:delete")
@@ -175,10 +192,12 @@ class BotUI:
             entry = next((e for e in self.data_list("pe") if e["id"] == ident), None)
             if entry is None:
                 raise ValueError("Запись уже удалена.")
-            self.tg.send(f"Удалить запись #{ident} от {entry['date']} (пар: {entry['count']})?",
+            self.send(f"Удалить запись #{ident} от {entry['date']} (пар: {entry['count']})?",
                          reply_markup=keyboard([button("🗑 Да, удалить", f"pe:remove:{ident}"), button("Отмена", "pe")]))
         elif action.startswith("pe:remove:"):
-            self.tg.send(self.features.command("/pe del " + action.rsplit(":", 1)[1], {}))
+            result = self.features.command("/pe del " + action.rsplit(":", 1)[1], {})
+            if result.startswith("❗"):
+                raise ValueError("Запись уже удалена.")
             self.show_pe()
         elif action == "tasks" or action == "tasks:all":
             self.show_tasks(all_tasks=action == "tasks:all")
@@ -193,13 +212,13 @@ class BotUI:
             if verb == "view":
                 self.show_task(ident)
             elif verb in ("done", "open", "del"):
-                self.tg.send(self.features.command(f"/todo {verb} {ident}", {}))
+                self.features.command(f"/todo {verb} {ident}", {})
                 self.show_tasks() if verb == "del" else self.show_task(ident)
             elif verb == "deadline":
                 self.prompt("task_deadline", "📅 Напиши новый дедлайн, например 10.11.2026, или нажми «Снять дедлайн».",
                             {"id": ident}, keyboard([button("Снять дедлайн", "task:cleardue")], [button("Отмена", "cancel")]))
             elif verb == "confirm":
-                self.tg.send(f"Удалить дело #{ident}?", reply_markup=keyboard([button("🗑 Да, удалить", f"task:del:{ident}"), button("Отмена", f"task:view:{ident}")]))
+                self.send(f"Удалить дело #{ident}?", reply_markup=keyboard([button("🗑 Да, удалить", f"task:del:{ident}"), button("Отмена", f"task:view:{ident}")]))
             else:
                 raise ValueError("Неизвестное действие. Открой меню заново.")
         elif action == "auto":
@@ -217,7 +236,7 @@ class BotUI:
 
     def handle_text(self, text):
         routes = {"/start": "home", "/help": "home", "/menu": "home", "/cancel": "cancel",
-                  "/subjects": "subjects", "/pe": "pe", "/todo": "tasks", "/auto": "auto",
+                  "/subjects": "subjects", "/absences": "absences", "/pe": "pe", "/todo": "tasks", "/auto": "auto",
                   "/status": "status", "/check": "check"}
         if text in routes:
             self.action(routes[text])
@@ -229,7 +248,7 @@ class BotUI:
             return False
         if self.expired():
             self.pending = None
-            self.tg.send("Время ввода истекло. Открой нужный раздел заново.")
+            self.send("Время ввода истекло. Открой нужный раздел заново.")
             return True
         state = self.pending
         try:
@@ -246,7 +265,8 @@ class BotUI:
                     raise ValueError("Количество пар: от 1 до 100.")
                 result = self.features.command(f"/pe add {state['date']} {count}", {})
                 self.pending = None
-                self.tg.send(result)
+                if result.startswith("❗"):
+                    raise ValueError("Не удалось добавить запись физры.")
                 self.show_pe()
             elif kind == "task_title":
                 title = text.strip()
@@ -258,13 +278,13 @@ class BotUI:
                 due = None if text == "-" else parse_date(text)
                 task = self.features.create_task(state["title"], due)
                 self.pending = None
-                self.tg.send(f"Дело #{task['id']} добавлено.")
                 self.show_task(task["id"])
             elif kind == "task_deadline":
                 due = "-" if text == "-" else parse_date(text)
                 result = self.features.command(f"/todo deadline {state['id']} {due}", {})
                 self.pending = None
-                self.tg.send(result)
+                if result.startswith("❗"):
+                    raise ValueError("Дело уже удалено.")
                 self.show_task(state["id"])
             elif kind == "auto_score":
                 try:
@@ -282,8 +302,7 @@ class BotUI:
                     raise ValueError("Количество занятий: от 1 до 1000.")
                 self.features.command(f"/auto {state['idx']+1} {state['score']} {total}", {})
                 self.pending = None
-                self.tg.send("Условия автомата сохранены.")
                 self.show_auto()
         except (ValueError, OverflowError) as exc:
-            self.tg.send("❗ " + html.escape(str(exc)) + "\nПопробуй ещё раз.", reply_markup=CANCEL)
+            self.send("❗ " + html.escape(str(exc)) + "\nПопробуй ещё раз.", reply_markup=CANCEL)
         return True

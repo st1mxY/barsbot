@@ -17,8 +17,18 @@ class FakeTelegram:
     def __init__(self):
         self.messages = []
         self.answers = []
+        self.edits = []
+        self.last_message_id = None
+        self.send_count = 0
 
     def send(self, text, chat_id=None, reply_markup=MAIN_MENU):
+        self.messages.append((text, reply_markup))
+        self.send_count += 1
+        self.last_message_id = self.send_count
+        return True
+
+    def edit_message(self, ident, text, reply_markup=MAIN_MENU):
+        self.edits.append((ident, text, reply_markup))
         self.messages.append((text, reply_markup))
         return True
 
@@ -39,7 +49,7 @@ class UITests(unittest.TestCase):
 
     def click(self, data, sender=42):
         self.ui.handle_callback({"id": "callback", "from": {"id": sender},
-                                 "message": {"chat": {"id": 42}}, "data": data})
+                                 "message": {"chat": {"id": 42}, "message_id": 17}, "data": data})
 
     def test_pe_add_total_delete_and_repeat_click(self):
         self.click("pe:add")
@@ -97,7 +107,7 @@ class UITests(unittest.TestCase):
         self.assertIn("уже удалено", self.tg.messages[-1][0])
 
     def test_navigation_and_auto_settings(self):
-        for route in ("home", "subjects", "auto", "pe", "tasks", "status"):
+        for route in ("home", "subjects", "absences", "auto", "pe", "tasks", "status"):
             self.click(route)
             self.assertIn("inline_keyboard", self.tg.messages[-1][1])
         self.click("auto:edit:1")
@@ -106,6 +116,23 @@ class UITests(unittest.TestCase):
         self.ui.handle_text("4,2")
         self.ui.handle_text("48")
         self.assertEqual(self.f.data["targets"]["1"], {"score": 4.2, "lessons": 48})
+
+    def test_navigation_replaces_clicked_menu_instead_of_sending(self):
+        self.click("home")
+        self.click("absences")
+        self.click("tasks")
+        self.click("home")
+        self.assertEqual(self.tg.send_count, 0)
+        self.assertTrue(all(edit[0] == 17 for edit in self.tg.edits))
+        self.assertIn("Пропуски БАРС", str(self.tg.edits[-1][2]))
+
+    def test_edit_timeout_does_not_create_duplicate_but_deleted_menu_is_replaced(self):
+        with patch.object(self.tg, "edit_message", return_value=None):
+            self.click("home")
+        self.assertEqual(self.tg.send_count, 0)
+        with patch.object(self.tg, "edit_message", return_value=False):
+            self.click("home")
+        self.assertEqual(self.tg.send_count, 1)
 
     def test_pagination_and_callback_payload_limits(self):
         for i in range(8):
@@ -124,7 +151,7 @@ class UITests(unittest.TestCase):
     def test_keyboard_only_on_last_chunk(self):
         response = Mock(ok=True)
         response.json.return_value = {"ok": True}
-        with patch("bars_bot.requests.post", return_value=response) as post:
+        with patch("bars_bot.requests.Session.post", return_value=response) as post:
             self.assertTrue(Telegram("test", "42").send("a" * 2000 + "\n" + "b" * 2000))
         payloads = [call.kwargs["json"] for call in post.call_args_list]
         self.assertEqual(len(payloads), 2)
