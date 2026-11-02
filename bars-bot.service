@@ -1,0 +1,18 @@
+[Unit]
+Description=БАРС МЭИ -> Telegram уведомления
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# поменяй пользователя и путь на свои
+User=bars
+WorkingDirectory=/opt/bars-bot
+ExecStart=/opt/bars-bot/venv/bin/python /opt/bars-bot/bars_bot.py
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Europe/Moscow
+
+[Install]
+WantedBy=multi-user.target

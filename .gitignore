@@ -1,0 +1,9 @@
+.env
+cookies.pkl
+state.json
+personal.json
+dumps/
+venv/
+.venv/
+__pycache__/
+.test-*/
